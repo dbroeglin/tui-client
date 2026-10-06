@@ -14,13 +14,56 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
 use reqwest::Client;
 use shared_models::{CreateTask, Task};
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:3000";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InputField {
+    Content,
+    Title,
+}
+
+struct TaskInput {
+    content: String,
+    title: String,
+    field: InputField,
+}
+
+impl TaskInput {
+    fn new() -> Self {
+        Self {
+            content: String::new(),
+            title: String::new(),
+            field: InputField::Content,
+        }
+    }
+
+    fn active(&self) -> &str {
+        match self.field {
+            InputField::Content => &self.content,
+            InputField::Title => &self.title,
+        }
+    }
+
+    fn active_mut(&mut self) -> &mut String {
+        match self.field {
+            InputField::Content => &mut self.content,
+            InputField::Title => &mut self.title,
+        }
+    }
+
+    fn toggle_field(&mut self) {
+        self.field = match self.field {
+            InputField::Content => InputField::Title,
+            InputField::Title => InputField::Content,
+        };
+    }
+}
 
 struct ApiClient {
     base_url: String,
@@ -48,10 +91,10 @@ impl ApiClient {
             .context("backend returned an invalid task list")
     }
 
-    async fn create(&self, title: String) -> Result<Task> {
+    async fn create(&self, title: String, content: String) -> Result<Task> {
         self.http
             .post(format!("{}/api/tasks", self.base_url))
-            .json(&CreateTask { title })
+            .json(&CreateTask { title, content })
             .send()
             .await
             .context("failed to connect to backend API")?
@@ -92,7 +135,7 @@ struct App {
     tasks: Vec<Task>,
     selection: ListState,
     message: String,
-    task_input: Option<String>,
+    task_input: Option<TaskInput>,
 }
 
 impl App {
@@ -118,8 +161,8 @@ impl App {
     }
 
     fn begin_add(&mut self) {
-        self.task_input = Some(String::new());
-        self.message = "Enter a task title".into();
+        self.task_input = Some(TaskInput::new());
+        self.message = "Enter task content and title; Tab switches fields".into();
     }
 
     fn cancel_add(&mut self) {
@@ -129,13 +172,13 @@ impl App {
 
     fn push_input(&mut self, character: char) {
         if let Some(input) = &mut self.task_input {
-            input.push(character);
+            input.active_mut().push(character);
         }
     }
 
     fn pop_input(&mut self) {
         if let Some(input) = &mut self.task_input {
-            input.pop();
+            input.active_mut().pop();
         }
     }
 
@@ -143,6 +186,11 @@ impl App {
         match code {
             KeyCode::Esc => self.cancel_add(),
             KeyCode::Enter | KeyCode::Char('\n' | '\r') => self.submit_add().await,
+            KeyCode::Tab | KeyCode::BackTab => {
+                if let Some(input) = &mut self.task_input {
+                    input.toggle_field();
+                }
+            }
             KeyCode::Backspace => self.pop_input(),
             KeyCode::Char(character)
                 if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
@@ -157,14 +205,20 @@ impl App {
         let Some(input) = &self.task_input else {
             return;
         };
-        let title = input.trim();
+        let content = input.content.trim();
+        if content.is_empty() {
+            self.message = "Task content cannot be blank".into();
+            return;
+        }
+        let title = input.title.trim();
         if title.is_empty() {
             self.message = "Task title cannot be blank".into();
             return;
         }
+        let content = content.to_owned();
         let title = title.to_owned();
 
-        match self.api.create(title).await {
+        match self.api.create(title, content).await {
             Ok(task) => {
                 self.tasks.push(task);
                 self.selection.select(Some(self.tasks.len() - 1));
@@ -305,7 +359,7 @@ fn render(frame: &mut ratatui::Frame, app: &mut App) {
             Constraint::Length(3),
             Constraint::Min(4),
             Constraint::Length(4),
-            Constraint::Length(3),
+            Constraint::Length(4),
         ]
     } else {
         vec![
@@ -337,7 +391,14 @@ fn render(frame: &mut ratatui::Frame, app: &mut App) {
         } else {
             Style::default()
         };
-        ListItem::new(Line::from(format!("{marker} {}", task.title))).style(style)
+        ListItem::new(vec![
+            Line::from(Span::styled(
+                task.content.as_str(),
+                Style::default().add_modifier(Modifier::ITALIC),
+            )),
+            Line::from(format!("{marker} {}", task.title)),
+        ])
+        .style(style)
     });
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title("Tasks"))
@@ -360,21 +421,43 @@ fn render(frame: &mut ratatui::Frame, app: &mut App) {
 
     if let Some(input) = &app.task_input {
         let input_area = areas[3];
+        let content_style = if input.field == InputField::Content {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        };
+        let title_style = if input.field == InputField::Title {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        };
         frame.render_widget(
-            Paragraph::new(input.as_str())
-                .style(Style::default().fg(Color::Yellow))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("New task (Enter to save, Esc to cancel)"),
-                ),
+            Paragraph::new(vec![
+                Line::from(vec![
+                    Span::raw("Content: "),
+                    Span::styled(input.content.as_str(), content_style),
+                ]),
+                Line::from(vec![
+                    Span::raw("Title:   "),
+                    Span::styled(input.title.as_str(), title_style),
+                ]),
+            ])
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("New task (Tab switches, Enter saves, Esc cancels)"),
+            ),
             input_area,
         );
-        let max_offset = input_area.width.saturating_sub(3);
-        let input_offset = u16::try_from(input.chars().count())
+        let max_offset = input_area.width.saturating_sub(11);
+        let input_offset = u16::try_from(input.active().chars().count())
             .unwrap_or(u16::MAX)
             .min(max_offset);
-        frame.set_cursor_position((input_area.x + 1 + input_offset, input_area.y + 1));
+        let cursor_y = match input.field {
+            InputField::Content => input_area.y + 1,
+            InputField::Title => input_area.y + 2,
+        };
+        frame.set_cursor_position((input_area.x + 10 + input_offset, cursor_y));
     }
 }
 
@@ -395,20 +478,38 @@ mod tests {
         app.push_input('o');
         app.pop_input();
 
-        assert_eq!(app.task_input.as_deref(), Some("D"));
+        assert_eq!(
+            app.task_input.as_ref().map(|input| input.content.as_str()),
+            Some("D")
+        );
         app.cancel_add();
-        assert_eq!(app.task_input, None);
+        assert!(app.task_input.is_none());
     }
 
     #[tokio::test]
-    async fn blank_task_stays_in_add_mode() {
+    async fn blank_content_stays_in_add_mode() {
         let mut app = app();
         app.begin_add();
         app.push_input(' ');
 
         app.handle_add_key(KeyCode::Enter, KeyModifiers::NONE).await;
 
-        assert_eq!(app.task_input.as_deref(), Some(" "));
+        assert_eq!(
+            app.task_input.as_ref().map(|input| input.content.as_str()),
+            Some(" ")
+        );
+        assert_eq!(app.message, "Task content cannot be blank");
+    }
+
+    #[tokio::test]
+    async fn blank_title_stays_in_add_mode() {
+        let mut app = app();
+        app.begin_add();
+        app.push_input('C');
+        app.handle_add_key(KeyCode::Tab, KeyModifiers::NONE).await;
+
+        app.handle_add_key(KeyCode::Enter, KeyModifiers::NONE).await;
+
         assert_eq!(app.message, "Task title cannot be blank");
     }
 }

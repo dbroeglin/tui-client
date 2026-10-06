@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -92,7 +92,7 @@ struct App {
     tasks: Vec<Task>,
     selection: ListState,
     message: String,
-    sample_number: usize,
+    task_input: Option<String>,
 }
 
 impl App {
@@ -102,7 +102,7 @@ impl App {
             tasks: Vec::new(),
             selection: ListState::default(),
             message: "Press r to load tasks".into(),
-            sample_number: 1,
+            task_input: None,
         }
     }
 
@@ -117,13 +117,58 @@ impl App {
         }
     }
 
-    async fn add_sample(&mut self) {
-        let title = format!("Copilot demo task {}", self.sample_number);
+    fn begin_add(&mut self) {
+        self.task_input = Some(String::new());
+        self.message = "Enter a task title".into();
+    }
+
+    fn cancel_add(&mut self) {
+        self.task_input = None;
+        self.message = "Task creation cancelled".into();
+    }
+
+    fn push_input(&mut self, character: char) {
+        if let Some(input) = &mut self.task_input {
+            input.push(character);
+        }
+    }
+
+    fn pop_input(&mut self) {
+        if let Some(input) = &mut self.task_input {
+            input.pop();
+        }
+    }
+
+    async fn handle_add_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        match code {
+            KeyCode::Esc => self.cancel_add(),
+            KeyCode::Enter | KeyCode::Char('\n' | '\r') => self.submit_add().await,
+            KeyCode::Backspace => self.pop_input(),
+            KeyCode::Char(character)
+                if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.push_input(character);
+            }
+            _ => {}
+        }
+    }
+
+    async fn submit_add(&mut self) {
+        let Some(input) = &self.task_input else {
+            return;
+        };
+        let title = input.trim();
+        if title.is_empty() {
+            self.message = "Task title cannot be blank".into();
+            return;
+        }
+        let title = title.to_owned();
+
         match self.api.create(title).await {
             Ok(task) => {
                 self.tasks.push(task);
                 self.selection.select(Some(self.tasks.len() - 1));
-                self.sample_number += 1;
+                self.task_input = None;
                 self.message = "Task created".into();
             }
             Err(error) => self.message = format!("{error:#}"),
@@ -234,13 +279,17 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App) ->
         let Event::Key(key) = event::read()? else {
             continue;
         };
-        if key.kind != KeyEventKind::Press {
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+        if app.task_input.is_some() {
+            app.handle_add_key(key.code, key.modifiers).await;
             continue;
         }
         match key.code {
             KeyCode::Char('q') => return Ok(()),
             KeyCode::Char('r') => app.refresh().await,
-            KeyCode::Char('a') => app.add_sample().await,
+            KeyCode::Char('a') => app.begin_add(),
             KeyCode::Char(' ') | KeyCode::Enter => app.toggle_selected().await,
             KeyCode::Char('d') | KeyCode::Delete => app.delete_selected().await,
             KeyCode::Down | KeyCode::Char('j') => app.select_next(),
@@ -251,13 +300,23 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App) ->
 }
 
 fn render(frame: &mut ratatui::Frame, app: &mut App) {
-    let areas = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
+    let constraints = if app.task_input.is_some() {
+        vec![
             Constraint::Length(3),
             Constraint::Min(4),
+            Constraint::Length(4),
             Constraint::Length(3),
-        ])
+        ]
+    } else {
+        vec![
+            Constraint::Length(3),
+            Constraint::Min(4),
+            Constraint::Length(4),
+        ]
+    };
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
         .split(frame.area());
 
     frame.render_widget(
@@ -298,4 +357,58 @@ fn render(frame: &mut ratatui::Frame, app: &mut App) {
         Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
         areas[2],
     );
+
+    if let Some(input) = &app.task_input {
+        let input_area = areas[3];
+        frame.render_widget(
+            Paragraph::new(input.as_str())
+                .style(Style::default().fg(Color::Yellow))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("New task (Enter to save, Esc to cancel)"),
+                ),
+            input_area,
+        );
+        let max_offset = input_area.width.saturating_sub(3);
+        let input_offset = u16::try_from(input.chars().count())
+            .unwrap_or(u16::MAX)
+            .min(max_offset);
+        frame.set_cursor_position((input_area.x + 1 + input_offset, input_area.y + 1));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app() -> App {
+        App::new(ApiClient::new(DEFAULT_API_URL.into()))
+    }
+
+    #[test]
+    fn add_mode_collects_and_cancels_input() {
+        let mut app = app();
+
+        app.begin_add();
+        app.push_input('D');
+        app.push_input('o');
+        app.pop_input();
+
+        assert_eq!(app.task_input.as_deref(), Some("D"));
+        app.cancel_add();
+        assert_eq!(app.task_input, None);
+    }
+
+    #[tokio::test]
+    async fn blank_task_stays_in_add_mode() {
+        let mut app = app();
+        app.begin_add();
+        app.push_input(' ');
+
+        app.handle_add_key(KeyCode::Enter, KeyModifiers::NONE).await;
+
+        assert_eq!(app.task_input.as_deref(), Some(" "));
+        assert_eq!(app.message, "Task title cannot be blank");
+    }
 }

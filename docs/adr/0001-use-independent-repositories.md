@@ -17,8 +17,9 @@ load every crate and follow references across component boundaries.
 ## Decision
 
 Maintain the TUI client, backend API, and shared models as independent
-repositories. Open them together through the root `cld-demo.code-workspace`
-multi-root workspace and list every crate in `rust-analyzer.linkedProjects`.
+repositories. Open them together through a separately maintained root
+`cld-demo.code-workspace` multi-root workspace and list every crate in
+`rust-analyzer.linkedProjects`.
 
 Coordinate cross-repository changes explicitly. Each affected repository keeps
 its own history, validation, and release boundary.

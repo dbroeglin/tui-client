@@ -3,14 +3,19 @@
 This directory is the central architecture decision log for the complete demo
 workspace:
 
-- `tui-client`
-- `backend-api`
-- `shared-models`
+- [`tui-client`](https://github.com/dbroeglin/tui-client)
+- [`backend-api`](https://github.com/dbroeglin/backend-api)
+- [`shared-models`](https://github.com/dbroeglin/shared-models)
 
 The records live in `tui-client` so developers have one discoverable decision
 log while working across the three independent repositories. A decision can
 apply to one component or to the integration among components; each record
 states its scope.
+
+The repositories are expected to be sibling directories because both
+applications use a local path dependency on `shared-models`. The optional
+multi-root VS Code workspace described in ADR 0001 is maintained outside the
+independent component repositories.
 
 ## Status values
 

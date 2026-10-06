@@ -444,11 +444,11 @@ fn render(frame: &mut ratatui::Frame, app: &mut App) {
             Style::default()
         };
         ListItem::new(vec![
+            Line::from(format!("{marker} {}", task.title)),
             Line::from(Span::styled(
                 task.content.as_str(),
                 Style::default().add_modifier(Modifier::ITALIC),
             )),
-            Line::from(format!("{marker} {}", task.title)),
         ])
         .style(style)
     });

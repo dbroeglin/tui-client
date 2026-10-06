@@ -32,4 +32,4 @@ decision records for the complete multi-repository workspace, including
 | `r` | Refresh |
 | `q` | Quit |
 
-The task list displays each task's content above its title.
+The task list displays each task's title above its content.

@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
@@ -17,10 +17,12 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
-use reqwest::Client;
-use shared_models::{CreateTask, Task};
+use reqwest::{Client, RequestBuilder, Response, Url};
+use shared_models::{CreateTask, ErrorResponse, Task};
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:3000";
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InputField {
@@ -66,66 +68,115 @@ impl TaskInput {
 }
 
 struct ApiClient {
-    base_url: String,
+    base_url: Url,
     http: Client,
 }
 
 impl ApiClient {
-    fn new(base_url: String) -> Self {
-        Self {
-            base_url,
-            http: Client::new(),
+    fn new(base_url: String) -> Result<Self> {
+        let mut base_url = Url::parse(&base_url).context("DEMO_API_URL is not a valid URL")?;
+        if !matches!(base_url.scheme(), "http" | "https") {
+            bail!("DEMO_API_URL must use http or https");
+        }
+        if base_url.cannot_be_a_base() {
+            bail!("DEMO_API_URL cannot be used as a base URL");
+        }
+        if base_url.query().is_some() || base_url.fragment().is_some() {
+            bail!("DEMO_API_URL must not contain a query string or fragment");
+        }
+        let path = format!("{}/", base_url.path().trim_end_matches('/'));
+        base_url.set_path(&path);
+
+        let http = Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .context("failed to configure HTTP client")?;
+
+        Ok(Self { base_url, http })
+    }
+
+    fn endpoint(&self, path: &str) -> Result<Url> {
+        self.base_url
+            .join(path)
+            .with_context(|| format!("failed to construct API endpoint for {path}"))
+    }
+
+    async fn send(&self, request: RequestBuilder, operation: &str) -> Result<Response> {
+        request.send().await.map_err(|error| {
+            if error.is_timeout() {
+                anyhow!("timed out while {operation}")
+            } else if error.is_connect() {
+                anyhow!("could not connect to the backend while {operation}: {error}")
+            } else {
+                anyhow!("HTTP failure while {operation}: {error}")
+            }
+        })
+    }
+
+    async fn require_success(&self, response: Response, operation: &str) -> Result<Response> {
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+
+        match response.json::<ErrorResponse>().await {
+            Ok(error) => bail!("backend rejected {operation} ({status}): {}", error.message),
+            Err(error) => bail!(
+                "backend rejected {operation} ({status}) and returned an invalid error response: {error}"
+            ),
         }
     }
 
     async fn tasks(&self) -> Result<Vec<Task>> {
-        self.http
-            .get(format!("{}/api/tasks", self.base_url))
-            .send()
-            .await
-            .context("failed to connect to backend API")?
-            .error_for_status()
-            .context("backend rejected task list request")?
+        let response = self
+            .send(self.http.get(self.endpoint("api/tasks")?), "loading tasks")
+            .await?;
+        self.require_success(response, "task list request")
+            .await?
             .json()
             .await
             .context("backend returned an invalid task list")
     }
 
     async fn create(&self, title: String, content: String) -> Result<Task> {
-        self.http
-            .post(format!("{}/api/tasks", self.base_url))
-            .json(&CreateTask { title, content })
-            .send()
-            .await
-            .context("failed to connect to backend API")?
-            .error_for_status()
-            .context("backend rejected task creation")?
+        let response = self
+            .send(
+                self.http
+                    .post(self.endpoint("api/tasks")?)
+                    .json(&CreateTask { title, content }),
+                "creating a task",
+            )
+            .await?;
+        self.require_success(response, "task creation")
+            .await?
             .json()
             .await
             .context("backend returned an invalid task")
     }
 
     async fn toggle(&self, id: u64) -> Result<Task> {
-        self.http
-            .patch(format!("{}/api/tasks/{id}", self.base_url))
-            .send()
-            .await
-            .context("failed to connect to backend API")?
-            .error_for_status()
-            .context("backend rejected task update")?
+        let response = self
+            .send(
+                self.http.patch(self.endpoint(&format!("api/tasks/{id}"))?),
+                "updating a task",
+            )
+            .await?;
+        self.require_success(response, "task update")
+            .await?
             .json()
             .await
             .context("backend returned an invalid task")
     }
 
     async fn delete(&self, id: u64) -> Result<()> {
-        self.http
-            .delete(format!("{}/api/tasks/{id}", self.base_url))
-            .send()
-            .await
-            .context("failed to connect to backend API")?
-            .error_for_status()
-            .context("backend rejected task deletion")?;
+        let response = self
+            .send(
+                self.http.delete(self.endpoint(&format!("api/tasks/{id}"))?),
+                "deleting a task",
+            )
+            .await?;
+        self.require_success(response, "task deletion").await?;
         Ok(())
     }
 }
@@ -300,8 +351,9 @@ impl App {
 #[tokio::main]
 async fn main() -> Result<()> {
     let api_url = std::env::var("DEMO_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.into());
+    let api = ApiClient::new(api_url)?;
     let mut terminal = setup_terminal()?;
-    let result = run(&mut terminal, App::new(ApiClient::new(api_url))).await;
+    let result = run(&mut terminal, App::new(api)).await;
     restore_terminal(&mut terminal)?;
     result
 }
@@ -466,7 +518,33 @@ mod tests {
     use super::*;
 
     fn app() -> App {
-        App::new(ApiClient::new(DEFAULT_API_URL.into()))
+        App::new(ApiClient::new(DEFAULT_API_URL.into()).unwrap())
+    }
+
+    #[test]
+    fn api_client_normalizes_the_base_url() {
+        let client = ApiClient::new("http://localhost:3000/demo".into()).unwrap();
+
+        assert_eq!(client.base_url.as_str(), "http://localhost:3000/demo/");
+        assert_eq!(
+            client.endpoint("api/tasks").unwrap().as_str(),
+            "http://localhost:3000/demo/api/tasks"
+        );
+    }
+
+    #[test]
+    fn api_client_rejects_invalid_base_urls() {
+        let invalid_url = ApiClient::new("not a URL".into()).err().unwrap();
+        let unsupported_scheme = ApiClient::new("ftp://localhost/tasks".into())
+            .err()
+            .unwrap();
+        let query = ApiClient::new("http://localhost:3000?tenant=demo".into())
+            .err()
+            .unwrap();
+
+        assert!(invalid_url.to_string().contains("not a valid URL"));
+        assert!(unsupported_scheme.to_string().contains("http or https"));
+        assert!(query.to_string().contains("query string or fragment"));
     }
 
     #[test]

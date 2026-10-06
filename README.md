@@ -10,7 +10,9 @@ Start the backend first, then:
 cargo run
 ```
 
-Set `DEMO_API_URL` to use a different backend URL.
+Set `DEMO_API_URL` to use a different backend URL. It must be an HTTP or HTTPS
+URL without a query string or fragment. Connections time out after 3 seconds,
+and requests time out after 10 seconds.
 
 ## Architecture decisions
 
